@@ -64,7 +64,8 @@ jobs:
 
           channel_root = "/" + "/".join(parts[:-2])
           base_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, channel_root, "", ""))
-          dmg_url = base_url.rstrip("/") + "/" + package["download"]
+          dmg_path = urllib.parse.quote(package["download"], safe="/")
+          dmg_url = base_url.rstrip("/") + "/" + dmg_path
 
           version = manifest["version"]
           app_name = "Kiro CLI.app"
