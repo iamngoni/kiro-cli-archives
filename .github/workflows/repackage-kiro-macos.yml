@@ -1,0 +1,215 @@
+name: Repackage Kiro macOS Archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      manifest_url:
+        description: "Manifest URL to resolve the official macOS DMG"
+        required: false
+        default: "https://prod.download.cli.kiro.dev/stable/latest/manifest.json"
+        type: string
+      force:
+        description: "Overwrite assets if the release tag already exists"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  repackage-macos:
+    runs-on: macos-latest
+    env:
+      DEFAULT_MANIFEST_URL: https://prod.download.cli.kiro.dev/stable/latest/manifest.json
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve source artifact
+        id: resolve
+        env:
+          INPUT_MANIFEST_URL: ${{ inputs.manifest_url }}
+        run: |
+          set -euo pipefail
+          MANIFEST_URL="${INPUT_MANIFEST_URL:-$DEFAULT_MANIFEST_URL}"
+          export MANIFEST_URL
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+          import urllib.parse
+          import urllib.request
+
+          manifest_url = os.environ["MANIFEST_URL"]
+
+          with urllib.request.urlopen(manifest_url) as response:
+              manifest = json.load(response)
+
+          package = next(
+              item
+              for item in manifest["packages"]
+              if item.get("os") == "macos"
+              and item.get("fileType") == "dmg"
+              and item.get("architecture") == "universal"
+          )
+
+          parsed = urllib.parse.urlsplit(manifest_url)
+          parts = [part for part in parsed.path.split("/") if part]
+          if len(parts) < 3 or parts[-1] != "manifest.json":
+              raise SystemExit(f"Unsupported manifest URL: {manifest_url}")
+
+          channel_root = "/" + "/".join(parts[:-2])
+          base_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, channel_root, "", ""))
+          dmg_url = base_url.rstrip("/") + "/" + package["download"]
+
+          version = manifest["version"]
+          app_name = "Kiro CLI.app"
+          zip_name = f"kiro-cli-universal-apple-darwin-{version}.zip"
+          sha_name = f"{zip_name}.sha256"
+          metadata_name = f"kiro-cli-universal-apple-darwin-{version}.source.json"
+
+          print(f"manifest_url={manifest_url}")
+          print(f"version={version}")
+          print(f"release_tag=v{version}")
+          print(f"dmg_url={dmg_url}")
+          print(f"cli_path={package['cliPath']}")
+          print(f"zip_name={zip_name}")
+          print(f"sha_name={sha_name}")
+          print(f"metadata_name={metadata_name}")
+          print(f"app_name={app_name}")
+          PY
+
+      - name: Check for existing release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.resolve.outputs.release_tag }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "${FORCE:-}" = "true" ]; then
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "existing_release=true" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Repackage app bundle
+        if: steps.release.outputs.skip != 'true'
+        env:
+          DMG_URL: ${{ steps.resolve.outputs.dmg_url }}
+          ZIP_NAME: ${{ steps.resolve.outputs.zip_name }}
+          SHA_NAME: ${{ steps.resolve.outputs.sha_name }}
+          METADATA_NAME: ${{ steps.resolve.outputs.metadata_name }}
+          MANIFEST_URL: ${{ steps.resolve.outputs.manifest_url }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+          CLI_PATH: ${{ steps.resolve.outputs.cli_path }}
+          APP_NAME: ${{ steps.resolve.outputs.app_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          cleanup() {
+            if [ -n "${MOUNT_DIR:-}" ]; then
+              hdiutil detach "$MOUNT_DIR" -quiet || true
+            fi
+          }
+          trap cleanup EXIT
+
+          curl -fL "$DMG_URL" -o "dist/source.dmg"
+
+          ATTACH_PLIST="$(mktemp)"
+          export ATTACH_PLIST
+          hdiutil attach -nobrowse -readonly -plist "dist/source.dmg" > "$ATTACH_PLIST"
+
+          MOUNT_DIR="$(
+            python3 - <<'PY'
+            import os
+            import plistlib
+
+            with open(os.environ["ATTACH_PLIST"], "rb") as handle:
+                data = plistlib.load(handle)
+
+            for entity in data.get("system-entities", []):
+                mount_point = entity.get("mount-point")
+                if mount_point:
+                    print(mount_point)
+                    break
+            PY
+          )"
+
+          if [ -z "$MOUNT_DIR" ]; then
+            echo "Failed to determine mounted DMG path" >&2
+            exit 1
+          fi
+
+          APP_BUNDLE="$(find "$MOUNT_DIR" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          if [ -z "$APP_BUNDLE" ]; then
+            echo "Failed to locate .app bundle in mounted DMG" >&2
+            exit 1
+          fi
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "dist/$ZIP_NAME"
+          shasum -a 256 "dist/$ZIP_NAME" | awk '{print $1}' > "dist/$SHA_NAME"
+
+          export APP_BUNDLE
+          python3 - <<'PY' > "dist/$METADATA_NAME"
+          import json
+          import os
+          from datetime import datetime, timezone
+
+          payload = {
+              "version": os.environ["VERSION"],
+              "sourceManifestUrl": os.environ["MANIFEST_URL"],
+              "sourceDmgUrl": os.environ["DMG_URL"],
+              "sourceCliPath": os.environ["CLI_PATH"],
+              "packagedAppBundle": os.path.basename(os.environ["APP_BUNDLE"]),
+              "packagedAt": datetime.now(timezone.utc).isoformat(),
+          }
+          print(json.dumps(payload, indent=2))
+          PY
+
+          rm -f "$ATTACH_PLIST" "dist/source.dmg"
+
+      - name: Upload workflow artifact
+        if: steps.release.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.resolve.outputs.zip_name }}
+          path: |
+            dist/${{ steps.resolve.outputs.zip_name }}
+            dist/${{ steps.resolve.outputs.sha_name }}
+            dist/${{ steps.resolve.outputs.metadata_name }}
+
+      - name: Publish GitHub release
+        if: steps.release.outputs.skip != 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve.outputs.release_tag }}
+          name: Kiro CLI macOS archive ${{ steps.resolve.outputs.version }}
+          overwrite_files: true
+          make_latest: true
+          body: |
+            Repackaged from the official Kiro macOS DMG.
+
+            - Source manifest: `${{ steps.resolve.outputs.manifest_url }}`
+            - Source DMG: `${{ steps.resolve.outputs.dmg_url }}`
+            - CLI path inside app bundle: `${{ steps.resolve.outputs.cli_path }}`
+          files: |
+            dist/${{ steps.resolve.outputs.zip_name }}
+            dist/${{ steps.resolve.outputs.sha_name }}
+            dist/${{ steps.resolve.outputs.metadata_name }}
+
+      - name: Summarize skipped publish
+        if: steps.release.outputs.skip == 'true'
+        run: |
+          echo "Release ${{ steps.resolve.outputs.release_tag }} already exists. Re-run with force=true to overwrite assets." >> "$GITHUB_STEP_SUMMARY"
